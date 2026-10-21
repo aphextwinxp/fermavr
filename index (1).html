@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>VR Ферма — симулятор фермера</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="theme-color" content="#87ceeb">
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <style>
+    #info {
+      position: fixed; top: 12px; left: 12px; z-index: 10; max-width: 330px;
+      padding: 12px 14px; border-radius: 10px;
+      background: rgba(10, 20, 15, .78); color: #eef7e8;
+      font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      pointer-events: none;
+    }
+    #info b { color: #ffd54a; }
+  </style>
+</head>
+<body>
+
+<div id="info">
+  <b>VR Ферма</b><br>
+  1. Выберите <b>семена</b> на левой панели.<br>
+  2. Нажмите на грядку — посадите растение.<br>
+  3. Выберите <b>лейку</b> и полейте грядку.<br>
+  4. Когда над растением засветится маркер — выберите <b>серп</b> и соберите урожай.<br>
+  5. Продайте урожай на правой панели и покупайте новые грядки.<br><br>
+  <b>В шлеме:</b> нажмите «VR», луч контроллера + курок. Боковая кнопка (grip) — следующий инструмент.<br>
+  <b>На ПК:</b> ЛКМ + движение мыши — осмотреться, клик — действие. Клавиши 1–5 — инструменты, S — продать.
+</div>
+
+<script>
+  // ================= НАСТРОЙКИ =================
+  const DAY_LEN = 150;        // длина игрового дня (секунд)
+  const RAIN_CHANCE = 0.3;    // шанс дождя в начале нового дня
+  const WATER_SECONDS = 25;   // сколько секунд держится вода в грядке
+  const START_COINS = 30;
+  const GRID = 4;             // сетка грядок GRID x GRID
+  const START_UNLOCKED = [5, 6, 9, 10];
+  const SAVE_KEY = 'vrFarmSave_v1';
+
+  const CROPS = {
+    carrot:  { name: 'Морковь',  seed: 5,  time: 20, price: 12 },
+    wheat:   { name: 'Пшеница',  seed: 8,  time: 30, price: 20 },
+    pumpkin: { name: 'Тыква',    seed: 20, time: 60, price: 55 }
+  };
+
+  const TOOLS = [
+    { id: 'carrot',  name: 'Морковь', text: 'Морковь · ' + CROPS.carrot.seed + ' мон.',
+      hint: `Семена моркови: ${CROPS.carrot.seed} монет · растёт ${CROPS.carrot.time} с · продажа ${CROPS.carrot.price}` },
+    { id: 'wheat',   name: 'Пшеница', text: 'Пшеница · ' + CROPS.wheat.seed + ' мон.',
+      hint: `Семена пшеницы: ${CROPS.wheat.seed} монет · растёт ${CROPS.wheat.time} с · продажа ${CROPS.wheat.price}` },
+    { id: 'pumpkin', name: 'Тыква',   text: 'Тыква · ' + CROPS.pumpkin.seed + ' мон.',
+      hint: `Семена тыквы: ${CROPS.pumpkin.seed} монет · растёт ${CROPS.pumpkin.time} с · продажа ${CROPS.pumpkin.price}` },
+    { id: 'water',   name: 'Лейка',   text: 'Лейка',
+      hint: 'Лейка: польёте грядку — растение растёт, пока земля тёмная (влажная)' },
+    { id: 'harvest', name: 'Серп',    text: 'Серп (сбор)',
+      hint: 'Серп: собирает созревшие овощи (над ними светится жёлтый маркер)' }
+  ];
+
+  // ================= КОМПОНЕНТ: текст через canvas (поддерживает кириллицу) =================
+  AFRAME.registerComponent('label', {
+    schema: {
+      text:  { default: '' },
+      width: { default: 1 },
+      height:{ default: 0.3 },
+      size:  { default: 40 },
+      color: { default: '#ffffff' },
+      bg:    { default: 'none' },
+      align: { default: 'center' }
+    },
+    init() {
+      this.canvas = document.createElement('canvas');
+      this.ctx = this.canvas.getContext('2d');
+      this.sized = false;
+      this.tex = new THREE.CanvasTexture(this.canvas);
+      if (THREE.SRGBColorSpace) this.tex.colorSpace = THREE.SRGBColorSpace;
+      this.mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(1, 1),
+        new THREE.MeshBasicMaterial({ map: this.tex, transparent: true, toneMapped: false, depthWrite: false })
+      );
+      this.el.setObject3D('mesh', this.mesh);
+    },
+    update() {
+      const d = this.data, PPM = 360;
+      if (!this.sized) {
+        this.canvas.width  = Math.max(32, Math.min(2048, Math.round(d.width * PPM)));
+        this.canvas.height = Math.max(32, Math.min(2048, Math.round(d.height * PPM)));
+        this.sized = true;
+      }
+      this.mesh.scale.set(d.width, d.height, 1);
+      this.draw();
+    },
+    draw() {
+      const d = this.data, ctx = this.ctx, W = this.canvas.width, H = this.canvas.height;
+      ctx.clearRect(0, 0, W, H);
+      if (d.text === '') { this.tex.needsUpdate = true; return; }
+      if (d.bg !== 'none') {
+        ctx.fillStyle = d.bg;
+        const r = Math.min(24, H / 4);
+        ctx.beginPath();
+        ctx.moveTo(r, 0); ctx.lineTo(W - r, 0); ctx.quadraticCurveTo(W, 0, W, r);
+        ctx.lineTo(W, H - r); ctx.quadraticCurveTo(W, H, W - r, H);
+        ctx.lineTo(r, H); ctx.quadraticCurveTo(0, H, 0, H - r);
+        ctx.lineTo(0, r); ctx.quadraticCurveTo(0, 0, r, 0);
+        ctx.fill();
+      }
+      const lines = d.text.split('\n');
+      let s = d.size;
+      const font = () => `bold ${s}px "Segoe UI", system-ui, Arial, sans-serif`;
+      ctx.font = font();
+      const longest = lines.reduce((a, b) => (b.length > a.length ? b : a), '');
+      while (ctx.measureText(longest).width > W - 28 && s > 10) { s -= 2; ctx.font = font(); }
+      ctx.fillStyle = d.color;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = d.align;
+      const lh = s * 1.3;
+      const y0 = H / 2 - ((lines.length - 1) * lh) / 2;
+      const x = d.align === 'left' ? 16 : (d.align === 'right' ? W - 16 : W / 2);
+      lines.forEach((l, i) => ctx.fillText(l, x, y0 + i * lh));
+      this.tex.needsUpdate = true;
+    }
+  });
+
+  // ================= КОМПОНЕНТ: курок / grip на контроллере =================
+  AFRAME.registerComponent('trigger-act', {
+    init() {
+      const el = this.el;
+      el.addEventListener('triggerdown', () => {
+        const farm = el.sceneEl.components.farm;
+        const rc = el.components.raycaster;
+        const hit = rc && rc.intersectedEls && rc.intersectedEls[0];
+        if (hit) {
+          farm.activate(hit);
+          try { el.components['tracked-controls'].controller.gamepad.hapticActuators[0].pulse(0.4, 40); } catch (e) {}
+        }
+      });
+      el.addEventListener('gripdown', () => el.sceneEl.components.farm.cycleTool());
+    }
+  });
+
+  // ================= Модели растений (чистый THREE, без лишних сущностей) =================
+  function makeCrop(type) {
+    const g = new THREE.Group();
+    const tint = [];
+    const std = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.85 });
+
+    if (type === 'carrot') {
+      const leaf = std('#3f9b3a');
+      for (let i = 0; i < 5; i++) {
+        const m = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.38, 5), leaf);
+        const a = (i / 5) * Math.PI * 2;
+        m.position.set(Math.cos(a) * 0.06, 0.2, Math.sin(a) * 0.06);
+        m.rotation.set(Math.sin(a) * 0.35, 0, -Math.cos(a) * 0.35);
+        g.add(m);
+      }
+      const root = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 8), std('#ff8c1a'));
+      root.position.y = 0.02;
+      root.scale.set(1, 0.6, 1);
+      g.add(root);
+      g.userData.root = root;
+    } else if (type === 'wheat') {
+      const stalk = std('#6fb33f');
+      const head = std('#8cc05a');
+      tint.push({ mat: stalk, from: new THREE.Color('#6fb33f'), to: new THREE.Color('#d8b840') });
+      tint.push({ mat: head,  from: new THREE.Color('#8cc05a'), to: new THREE.Color('#f0c640') });
+      for (let i = 0; i < 9; i++) {
+        const gx = ((i % 3) - 1) * 0.22, gz = (Math.floor(i / 3) - 1) * 0.22;
+        const s = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.016, 0.6, 5), stalk);
+        s.position.set(gx, 0.3, gz);
+        g.add(s);
+        const h = new THREE.Mesh(new THREE.SphereGeometry(0.035, 6, 6), head);
+        h.scale.set(1, 3, 1);
+        h.position.set(gx, 0.62, gz);
+        g.add(h);
+      }
+    } else if (type === 'pumpkin') {
+      const body = std('#6a9a3a');
+      tint.push({ mat: body, from: new THREE.Color('#6a9a3a'), to: new THREE.Color('#f07818') });
+      const b = new THREE.Mesh(new THREE.SphereGeometry(0.28, 16, 12), body);
+      b.scale.set(1, 0.75, 1);
+      b.position.y = 0.21;
+      g.add(b);
+      const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.04, 0.1, 6), std('#5a4a2a'));
+      stem.position.y = 0.44;
+      g.add(stem);
+      const leafMat = std('#3f8a3a');
+      [[-0.3, 0.06, 0.1], [0.3, 0.06, -0.1]].forEach(([x, y, z]) => {
+        const l = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 6), leafMat);
+        l.scale.set(1, 0.15, 0.8);
+        l.position.set(x, y, z);
+        g.add(l);
+      });
+    }
+    g.userData.tint = tint;
+    g.traverse((m) => { if (m.isMesh) m.raycast = () => {}; }); // мышь/луч игнорируют растения
+    return g;
+  }
+
+  function disposeGroup(g) {
+    g.traverse((m) => {
+      if (m.isMesh) {
+        m.geometry.dispose();
+        if (m.material && m.material.dispose) m.material.dispose();
+      }
+    });
+  }
+
+  // ================= ОСНОВНАЯ ЛОГИКА ФЕРМЫ =================
+  AFRAME.registerComponent('farm', {
+    init() {
+      this.ready = false;
+      this.lastAct = 0;
+      this.tool = 'carrot';
+      this.plots = [];
+      this.inv = { carrot: 0, wheat: 0, pumpkin: 0 };
+      this.coins = START_COINS;
+      this.day = 1;
+      this.dayTime = DAY_LEN * 0.08;
+      this.rainLeft = 0;
+      this.rainK = 0;
+      this.toastUntil = 0;
+      this.resetArmedUntil = 0;
+      this.saveTimer = 0;
+      this.last = { status: '', tip: '', inv: '' };
+      this.clouds = [];
+      this.toolBtns = {};
+
+      this.skyColor = new THREE.Color('#87ceeb');
+      this.cDay = new THREE.Color('#87ceeb');
+      this.cNight = new THREE.Color('#0b1030');
+      this.cRain = new THREE.Color('#6c7885');
+
+      this.el.addEventListener('loaded', () => this.setup());
+      this.el.addEventListener('click', (e) => this.activate(e.target));
+      window.addEventListener('keydown', (e) => this.onKey(e));
+    },
+
+    // ---------- Построение сцены ----------
+    setup() {
+      const scene = this.el;
+      this.rays = {
+        mouseRay: document.querySelector('#mouseRay'),
+        rightHand: document.querySelector('#rightHand'),
+        leftHand: document.querySelector('#leftHand')
+      };
+      this.ambient = document.querySelector('#ambient');
+      this.sunlight = document.querySelector('#sunlight');
+
+      scene.object3D.background = this.skyColor;
+      scene.object3D.fog = new THREE.Fog(this.skyColor.clone(), 30, 120);
+
+      this.buildWorld();
+      this.buildPlots();
+      this.buildBoards();
+      this.buildHud();
+      this.buildRain();
+
+      scene.addEventListener('enter-vr', () => { const i = document.querySelector('#info'); if (i) i.style.display = 'none'; });
+      scene.addEventListener('exit-vr',  () => { const i = document.querySelector('#info'); if (i) i.style.display = ''; });
+
+      this.applyState(this.loadState());
+      this.ready = true;
+      this.refreshTools();
+      this.refreshInv(true);
+      this.toast('Добро пожаловать на ферму! Выберите семена и нажмите на грядку', 5000);
+    },
+
+    mk(parent, geom, mat, pos, rot) {
+      const e = document.createElement('a-entity');
+      if (geom) e.setAttribute('geometry', geom);
+      if (mat) e.setAttribute('material', mat);
+      if (pos) e.setAttribute('position', pos);
+      if (rot) e.setAttribute('rotation', rot);
+      (parent || this.el).appendChild(e);
+      return e;
+    },
+
+    buildWorld() {
+      const mk = this.mk.bind(this);
+      // земля
+      mk(null, { primitive: 'circle', radius: 100, segments: 48 }, { color: '#5a9a43', roughness: 1 }, null, { x: -90, y: 0, z: 0 });
+
+      // забор вокруг поля
+      const x0 = -2.5, x1 = 2.5, z0 = -1.95, z1 = -6.75;
+      const fenceLine = (ax, az, bx, bz) => {
+        const dx = bx - ax, dz = bz - az, L = Math.hypot(dx, dz);
+        const n = Math.max(1, Math.round(L / 1.25));
+        for (let i = 0; i <= n; i++) {
+          const px = ax + (dx * i) / n, pz = az + (dz * i) / n;
+          mk(null, { primitive: 'box', width: 0.09, height: 1, depth: 0.09 }, { color: '#8b5a2b' }, { x: px, y: 0.5, z: pz });
+        }
+        const yaw = (-Math.atan2(dz, dx) * 180) / Math.PI;
+        [0.4, 0.75].forEach((y) =>
+          mk(null, { primitive: 'box', width: L, height: 0.06, depth: 0.04 }, { color: '#a06a35' },
+            { x: (ax + bx) / 2, y, z: (az + bz) / 2 }, { x: 0, y: yaw, z: 0 }));
+      };
+      fenceLine(x0, z0, x1, z0);
+      fenceLine(x0, z1, x1, z1);
+      fenceLine(x0, z0, x0, z1);
+      fenceLine(x1, z0, x1, z1);
+
+      // табличка
+      const sign = this.mk(null, null, null, { x: 0, y: 2.2, z: -7.2 });
+      sign.setAttribute('label', { text: 'МОЯ ФЕРМА', width: 3, height: 0.6, size: 90, color: '#fff7d6', bg: 'rgba(90,50,20,0.85)' });
+
+      // амбар
+      mk(null, { primitive: 'box', width: 5, height: 3.2, depth: 4 }, { color: '#b3362e', roughness: 1 }, { x: -9, y: 1.6, z: -11 });
+      mk(null, { primitive: 'box', width: 3.2, height: 0.15, depth: 4.4 }, { color: '#5b3a24' }, { x: -10.3, y: 4.05, z: -11 }, { x: 0, y: 0, z: 33 });
+      mk(null, { primitive: 'box', width: 3.2, height: 0.15, depth: 4.4 }, { color: '#5b3a24' }, { x: -7.7, y: 4.05, z: -11 }, { x: 0, y: 0, z: -33 });
+      mk(null, { primitive: 'box', width: 1.8, height: 2.3, depth: 0.1 }, { color: '#f0e6d2' }, { x: -9, y: 1.15, z: -8.97 });
+      mk(null, { primitive: 'box', width: 0.12, height: 2.3, depth: 0.12 }, { color: '#8b5a2b' }, { x: -9, y: 1.15, z: -8.93 });
+
+      // деревья
+      [[7, -9], [10, -4], [-8, -3], [-12, -16], [13, -14], [4, -16], [-5, -17]].forEach(([x, z], i) => {
+        const h = 1.8 + (i % 3) * 0.4;
+        mk(null, { primitive: 'cylinder', radius: 0.22, height: h }, { color: '#6b4a2b' }, { x, y: h / 2, z });
+        mk(null, { primitive: 'sphere', radius: 1.3 + (i % 2) * 0.3 }, { color: i % 2 ? '#2f7d32' : '#3b8f3a', roughness: 1 }, { x, y: h + 0.9, z });
+      });
+
+      // горы
+      [[-40, -85, 18], [10, -90, 24], [55, -80, 16], [-75, -60, 14]].forEach(([x, z, h]) =>
+        mk(null, { primitive: 'cone', radiusBottom: h * 1.2, radiusTop: 0, height: h, segmentsRadial: 6 }, { color: '#6f8a78', roughness: 1 }, { x, y: h / 2, z }));
+
+      // солнце
+      this.sun = mk(null, { primitive: 'sphere', radius: 3 }, { shader: 'flat', color: '#fff2a8', fog: false }, { x: 0, y: 30, z: -50 });
+
+      // облака
+      for (let i = 0; i < 6; i++) {
+        const c = this.mk(null, null, null, { x: -60 + i * 22, y: 28 + (i % 3) * 3, z: -45 - (i % 2) * 12 });
+        [[0, 0, 0, 4], [4, -0.5, 1, 3], [-4, -0.5, -1, 3.2]].forEach(([x, y, z, r]) =>
+          this.mk(c, { primitive: 'sphere', radius: r }, { color: '#ffffff', roughness: 1 }, { x, y, z }));
+        this.clouds.push(c);
+      }
+
+      // рамка выбранной грядки
+      this.hoverBox = mk(null, { primitive: 'box', width: 1.06, height: 0.22, depth: 1.06 },
+        { shader: 'flat', color: '#ffe066', wireframe: true }, { x: 0, y: 0.1, z: -3 });
+      this.hoverBox.object3D.visible = false;
+    },
+
+    buildPlots() {
+      const marker = () => {
+        const m = new THREE.Mesh(new THREE.OctahedronGeometry(0.1), new THREE.MeshBasicMaterial({ color: 0xffe066 }));
+        m.raycast = () => {};
+        m.visible = false;
+        return m;
+      };
+      for (let r = 0; r < GRID; r++) {
+        for (let c = 0; c < GRID; c++) {
+          const i = r * GRID + c;
+          const x = (c - (GRID - 1) / 2) * 1.15;
+          const z = -2.6 - r * 1.15;
+          const el = this.mk(null, { primitive: 'box', width: 1, height: 0.14, depth: 1 },
+            { color: '#55683f', roughness: 1 }, { x, y: 0.07, z });
+          el.classList.add('plot');
+          el.dataset.i = i;
+          const mk = marker();
+          mk.position.set(0, 0.95, 0);
+          el.object3D.add(mk);
+          this.plots.push({ el, i, x, z, unlocked: false, crop: null, growth: 0, water: 0, group: null, marker: mk, lastColor: '' });
+        }
+      }
+    },
+
+    makeButton(parent, action, text, x, y, w, h, color, hint) {
+      const b = document.createElement('a-entity');
+      b.classList.add('btn');
+      b.dataset.action = action;
+      if (hint) b.dataset.hint = hint;
+      b.setAttribute('geometry', { primitive: 'box', width: w, height: h, depth: 0.06 });
+      b.setAttribute('material', { shader: 'flat', color });
+      b.setAttribute('position', { x, y, z: 0.05 });
+      const l = document.createElement('a-entity');
+      l.setAttribute('label', { text, width: w - 0.08, height: h - 0.04, size: Math.round((h - 0.04) * 360 * 0.42) });
+      l.setAttribute('position', { x: 0, y: 0, z: 0.04 });
+      b.appendChild(l);
+      parent.appendChild(b);
+      b.labelEl = l;
+      return b;
+    },
+
+    buildBoards() {
+      // левая панель: инструменты
+      const lx = -2.1, lz = -1.6;
+      const left = this.mk(null, { primitive: 'box', width: 1.85, height: 2.4, depth: 0.05 }, { shader: 'flat', color: '#26304a' },
+        { x: lx, y: 1.3, z: lz }, { x: 0, y: (Math.atan2(-lx, -lz) * 180) / Math.PI, z: 0 });
+      const head = this.mk(left, null, null, { x: 0, y: 0.98, z: 0.04 });
+      head.setAttribute('label', { text: 'Инструменты', width: 1.6, height: 0.3, size: 46, color: '#ffd54a' });
+      TOOLS.forEach((t, i) => {
+        this.toolBtns[t.id] = this.makeButton(left, 'tool:' + t.id, t.text, 0, 0.55 - i * 0.38, 1.6, 0.32, '#394b73', t.hint);
+      });
+
+      // правая панель: рынок
+      const rx = 2.1, rz = -1.6;
+      const right = this.mk(null, { primitive: 'box', width: 1.85, height: 2.4, depth: 0.05 }, { shader: 'flat', color: '#26304a' },
+        { x: rx, y: 1.3, z: rz }, { x: 0, y: (Math.atan2(-rx, -rz) * 180) / Math.PI, z: 0 });
+      const rh = this.mk(right, null, null, { x: 0, y: 0.98, z: 0.04 });
+      rh.setAttribute('label', { text: 'Рынок', width: 1.6, height: 0.3, size: 46, color: '#ffd54a' });
+      this.invLabel = this.mk(right, null, null, { x: 0, y: 0.3, z: 0.04 });
+      this.invLabel.setAttribute('label', { text: '', width: 1.7, height: 0.95, size: 36, align: 'left' });
+      this.sellBtn = this.makeButton(right, 'sell', 'Продать всё', 0, -0.5, 1.6, 0.4, '#2fa36b', 'Продать весь урожай из корзины (клавиша S)');
+      this.resetBtn = this.makeButton(right, 'reset', 'Сброс игры', 0, -0.98, 1.6, 0.3, '#7a3b3b', 'Начать игру заново (нажмите дважды)');
+    },
+
+    buildHud() {
+      const mkL = (y, opts) => {
+        const e = this.mk(null, null, null, { x: 0, y, z: -3.4 });
+        e.setAttribute('label', opts);
+        return e;
+      };
+      this.hud   = mkL(2.85, { text: '', width: 3.8, height: 0.38, size: 44, bg: 'rgba(10,14,30,0.65)' });
+      this.toastL = mkL(2.4,  { text: '', width: 3.8, height: 0.38, size: 44, color: '#ffe08a', bg: 'rgba(10,14,30,0.65)' });
+      this.tipL  = mkL(2.0,  { text: '', width: 3.8, height: 0.38, size: 40, bg: 'rgba(10,14,30,0.45)' });
+    },
+
+    buildRain() {
+      const N = 350;
+      this.rainN = N;
+      this.rainData = new Float32Array(N * 3);
+      this.rainPos = new Float32Array(N * 6);
+      for (let i = 0; i < N; i++) {
+        this.rainData[i * 3]     = (Math.random() - 0.5) * 22;
+        this.rainData[i * 3 + 1] = Math.random() * 9;
+        this.rainData[i * 3 + 2] = -Math.random() * 15 + 2;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(this.rainPos, 3));
+      this.rain = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0xaec6ff, transparent: true, opacity: 0.5 }));
+      this.rain.frustumCulled = false;
+      this.rain.visible = false;
+      this.el.object3D.add(this.rain);
+    },
+
+    // ---------- Звук ----------
+    getAC() {
+      if (!this.ac) this.ac = new (window.AudioContext || window.webkitAudioContext)();
+      if (this.ac.state === 'suspended') this.ac.resume();
+      return this.ac;
+    },
+    beep(freq, dur = 0.1, type = 'sine', vol = 0.12) {
+      try {
+        const ac = this.getAC();
+        const o = ac.createOscillator(), g = ac.createGain();
+        o.type = type;
+        o.frequency.value = freq;
+        g.gain.setValueAtTime(vol, ac.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+        o.connect(g); g.connect(ac.destination);
+        o.start(); o.stop(ac.currentTime + dur);
+      } catch (e) {}
+    },
+    splash(dur = 0.35, vol = 0.1) {
+      try {
+        const ac = this.getAC();
+        const len = Math.floor(ac.sampleRate * dur);
+        const buf = ac.createBuffer(1, len, ac.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+        const src = ac.createBufferSource();
+        src.buffer = buf;
+        const f = ac.createBiquadFilter();
+        f.type = 'bandpass'; f.frequency.value = 2200;
+        const g = ac.createGain(); g.gain.value = vol;
+        src.connect(f); f.connect(g); g.connect(ac.destination);
+        src.start();
+      } catch (e) {}
+    },
+
+    // ---------- Ввод ----------
+    onKey(e) {
+      if (!this.ready || e.ctrlKey || e.metaKey || e.altKey) return;
+      const n = parseInt(e.key, 10);
+      if (n >= 1 && n <= TOOLS.length) this.selectTool(TOOLS[n - 1].id);
+      else if (e.key === 's' || e.key === 'S' || e.key === 'ы' || e.key === 'Ы') this.sellAll();
+    },
+
+    activate(el) {
+      if (!this.ready || !el || !el.closest) return;
+      const now = performance.now();
+      if (now - this.lastAct < 150) return; // защита от двойного срабатывания (курок + клик)
+      const b = el.closest('.btn');
+      if (b) { this.lastAct = now; this.press(b.dataset.action); return; }
+      const pe = el.closest('.plot');
+      if (pe) { this.lastAct = now; this.usePlot(Number(pe.dataset.i)); }
+    },
+
+    press(action) {
+      if (action.startsWith('tool:')) this.selectTool(action.slice(5));
+      else if (action === 'sell') this.sellAll();
+      else if (action === 'reset') this.resetGame();
+    },
+
+    selectTool(id) {
+      if (!TOOLS.some((t) => t.id === id)) return;
+      this.tool = id;
+      this.refreshTools();
+      this.beep(500, 0.06, 'triangle', 0.08);
+    },
+    cycleTool() {
+      const i = TOOLS.findIndex((t) => t.id === this.tool);
+      this.selectTool(TOOLS[(i + 1) % TOOLS.length].id);
+    },
+
+    // ---------- Действия ----------
+    unlockedCount() { return this.plots.filter((p) => p.unlocked).length; },
+    plotCost() { return 40 + 25 * (this.unlockedCount() - START_UNLOCKED.length); },
+
+    usePlot(i) {
+      const p = this.plots[i];
+      if (!p) return;
+
+      if (!p.unlocked) {
+        const cost = this.plotCost();
+        if (this.coins >= cost) {
+          this.coins -= cost;
+          p.unlocked = true;
+          this.paintPlot(p);
+          this.toast('Новая грядка куплена!');
+          this.beep(520, 0.1, 'triangle');
+          setTimeout(() => this.beep(780, 0.15, 'triangle'), 90);
+          if (this.unlockedCount() === GRID * GRID) this.toast('Вся ферма ваша! Поздравляем, фермер!', 6000);
+          this.save();
+        } else {
+          this.toast(`Не хватает монет: нужно ${cost}`);
+          this.beep(150, 0.2, 'square', 0.07);
+        }
+        return;
+      }
+
+      const tool = this.tool;
+      if (CROPS[tool]) {
+        const def = CROPS[tool];
+        if (p.crop) { this.toast('Грядка уже занята'); this.beep(150, 0.15, 'square', 0.06); return; }
+        if (this.coins < def.seed) { this.toast('Не хватает монет на семена'); this.beep(150, 0.2, 'square', 0.07); return; }
+        this.coins -= def.seed;
+        this.setCrop(p, tool);
+        p.water = 0;
+        this.toast(`${def.name}: посажено — теперь полейте!`);
+        this.beep(330, 0.1, 'triangle');
+        this.save();
+      } else if (tool === 'water') {
+        if (!p.crop) { this.toast('Здесь пока нечего поливать'); this.beep(150, 0.12, 'square', 0.05); return; }
+        p.water = 1;
+        this.splash();
+        this.paintPlot(p);
+      } else if (tool === 'harvest') {
+        if (!p.crop) { this.toast('Грядка пуста'); this.beep(150, 0.12, 'square', 0.05); return; }
+        if (p.growth < 1) { this.toast('Ещё не созрело'); this.beep(200, 0.12, 'square', 0.05); return; }
+        const def = CROPS[p.crop];
+        this.inv[p.crop]++;
+        this.setCrop(p, null);
+        p.water = 0;
+        this.toast(`+1 ${def.name}`);
+        this.beep(660, 0.08, 'triangle');
+        setTimeout(() => this.beep(880, 0.1, 'triangle'), 70);
+        this.refreshInv();
+        this.save();
+      }
+    },
+
+    sellAll() {
+      let total = 0, count = 0;
+      for (const k in this.inv) { total += this.inv[k] * CROPS[k].price; count += this.inv[k]; this.inv[k] = 0; }
+      if (!count) { this.toast('Корзина пуста — нечего продавать'); this.beep(150, 0.15, 'square', 0.06); return; }
+      this.coins += total;
+      this.toast(`Продано ${count} шт. за ${total} монет`);
+      this.beep(988, 0.08, 'square', 0.07);
+      setTimeout(() => this.beep(1319, 0.2, 'square', 0.07), 80);
+      this.refreshInv();
+      this.save();
+    },
+
+    resetGame() {
+      const now = performance.now();
+      if (now < this.resetArmedUntil) {
+        try { localStorage.removeItem(SAVE_KEY); } catch (e) {}
+        this.applyState(this.defaultState());
+        this.refreshInv(true);
+        this.refreshTools();
+        this.resetArmedUntil = 0;
+        this.toast('Игра начата заново');
+      } else {
+        this.resetArmedUntil = now + 4000;
+        this.toast('Нажмите «Сброс игры» ещё раз, чтобы начать заново', 4000);
+      }
+    },
+
+    // ---------- Растения ----------
+    setCrop(p, type) {
+      if (p.group) { p.el.object3D.remove(p.group); disposeGroup(p.group); p.group = null; }
+      p.crop = type || null;
+      p.growth = 0;
+      p.marker.visible = false;
+      if (p.crop) {
+        p.group = makeCrop(p.crop);
+        p.group.position.set(0, 0.07, 0);
+        p.el.object3D.add(p.group);
+        this.updateCrop(p);
+      }
+    },
+
+    updateCrop(p) {
+      const g = p.group;
+      if (!g) return;
+      g.scale.setScalar(0.25 + 0.75 * Math.min(p.growth, 1));
+      g.userData.tint.forEach((t) => t.mat.color.copy(t.from).lerp(t.to, Math.min(p.growth, 1)));
+      const root = g.userData.root;
+      if (root) {
+        root.visible = p.growth > 0.55;
+        const k = Math.max(0, Math.min(1, (p.growth - 0.55) / 0.45));
+        root.scale.set(0.6 + 0.8 * k, 0.4 + 0.5 * k, 0.6 + 0.8 * k);
+      }
+    },
+
+    paintPlot(p) {
+      const col = !p.unlocked ? '#55683f' : (p.water > 0 ? '#3b2a1d' : '#7a5a3c');
+      if (col !== p.lastColor) {
+        p.el.setAttribute('material', 'color', col);
+        p.lastColor = col;
+      }
+    },
+
+    // ---------- Сохранение ----------
+    defaultState() {
+      return {
+        coins: START_COINS, day: 1, dayTime: DAY_LEN * 0.08, rainLeft: 0, tool: 'carrot',
+        inv: { carrot: 0, wheat: 0, pumpkin: 0 },
+        plots: this.plots.map((p, i) => ({ u: START_UNLOCKED.includes(i), c: null, g: 0, w: 0 }))
+      };
+    },
+    getState() {
+      return {
+        coins: this.coins, day: this.day, dayTime: this.dayTime, rainLeft: this.rainLeft, tool: this.tool,
+        inv: this.inv,
+        plots: this.plots.map((p) => ({ u: p.unlocked, c: p.crop, g: p.growth, w: p.water }))
+      };
+    },
+    loadState() {
+      try {
+        const s = JSON.parse(localStorage.getItem(SAVE_KEY));
+        if (s && Array.isArray(s.plots) && s.plots.length === this.plots.length) return s;
+      } catch (e) {}
+      return this.defaultState();
+    },
+    applyState(s) {
+      this.coins = s.coins; this.day = s.day; this.dayTime = s.dayTime;
+      this.rainLeft = s.rainLeft || 0; this.tool = s.tool || 'carrot';
+      this.inv = Object.assign({ carrot: 0, wheat: 0, pumpkin: 0 }, s.inv);
+      this.plots.forEach((p, i) => {
+        const d = s.plots[i];
+        p.unlocked = !!d.u;
+        this.setCrop(p, CROPS[d.c] ? d.c : null);
+        p.growth = d.g || 0;
+        p.water = d.w || 0;
+        if (p.crop) { this.updateCrop(p); p.marker.visible = p.growth >= 1; }
+        p.lastColor = '';
+        this.paintPlot(p);
+      });
+    },
+    save() {
+      try { localStorage.setItem(SAVE_KEY, JSON.stringify(this.getState())); } catch (e) {}
+    },
+
+    // ---------- Интерфейс ----------
+    toast(text, ms = 3200) {
+      this.toastL.setAttribute('label', 'text', text);
+      this.toastUntil = performance.now() + ms;
+    },
+
+    refreshTools() {
+      TOOLS.forEach((t) => {
+        const b = this.toolBtns[t.id];
+        if (b) b.setAttribute('material', 'color', t.id === this.tool ? '#2fa36b' : '#394b73');
+      });
+    },
+
+    refreshInv(force) {
+      let total = 0;
+      for (const k in this.inv) total += this.inv[k] * CROPS[k].price;
+      const text = 'Корзина:\n' +
+        Object.keys(CROPS).map((k) => `${CROPS[k].name}: ${this.inv[k]}  (×${CROPS[k].price})`).join('\n');
+      if (force || text !== this.last.inv) {
+        this.last.inv = text;
+        this.invLabel.setAttribute('label', 'text', text);
+      }
+      this.sellBtn.labelEl.setAttribute('label', 'text', total ? `Продать всё  +${total}` : 'Продать всё');
+    },
+
+    timeOfDay() {
+      const f = this.dayTime / DAY_LEN;
+      return f < 0.2 ? 'Утро' : f < 0.5 ? 'День' : f < 0.75 ? 'Вечер' : 'Ночь';
+    },
+
+    describePlot(p) {
+      if (!p.unlocked) return `Закрытая грядка — купить за ${this.plotCost()} монет (нажмите)`;
+      if (!p.crop) return 'Пустая грядка — выберите семена и нажмите на неё';
+      const def = CROPS[p.crop];
+      if (p.growth >= 1) return `${def.name}: ГОТОВО! Выберите серп и соберите`;
+      const w = p.water <= 0 ? ' · нужна вода!' : ` · вода ${Math.round(p.water * 100)}%`;
+      return `${def.name}: рост ${Math.round(p.growth * 100)}%${w}`;
+    },
+
+    getHovered() {
+      const ids = this.el.is('vr-mode') ? ['rightHand', 'leftHand'] : ['mouseRay'];
+      for (const id of ids) {
+        const e = this.rays[id];
+        const rc = e && e.components.raycaster;
+        if (rc && rc.intersectedEls && rc.intersectedEls.length) return rc.intersectedEls[0];
+      }
+      return null;
+    },
+
+    // ---------- Небо, свет, погода ----------
+    newDay() {
+      if (this.day > 1 && Math.random() < RAIN_CHANCE) {
+        this.rainLeft = 30;
+        this.toast(`День ${this.day}: начался дождь — грядки поливаются сами!`, 4500);
+      } else {
+        this.toast(`Наступил день ${this.day}`);
+      }
+      this.save();
+    },
+
+    updateSky(dt) {
+      const f = this.dayTime / DAY_LEN;
+      const s = f < 0.75 ? Math.sin((Math.PI * f) / 0.75) : -0.6 * Math.sin((Math.PI * (f - 0.75)) / 0.25);
+      const k = THREE.MathUtils.clamp((s + 0.15) / 0.45, 0, 1);
+      this.rainK += ((this.rainLeft > 0 ? 1 : 0) - this.rainK) * Math.min(1, dt * 1.5);
+
+      this.skyColor.copy(this.cNight).lerp(this.cDay, k);
+      this.skyColor.lerp(this.cRain, this.rainK * 0.6 * (0.3 + 0.7 * k));
+      const fog = this.el.object3D.fog;
+      if (fog) fog.color.copy(this.skyColor);
+
+      const amb = this.ambient.getObject3D('light');
+      const dir = this.sunlight.getObject3D('light');
+      if (amb) amb.intensity = 0.25 + 0.55 * k * (1 - 0.3 * this.rainK);
+      if (dir) dir.intensity = 0.05 + 0.95 * k * (1 - 0.65 * this.rainK);
+
+      const th = Math.PI * Math.min(f, 0.75) / 0.75;
+      this.sunlight.object3D.position.set(-Math.cos(th) * 10, Math.max(2, Math.sin(th) * 10), -4);
+      this.sun.object3D.position.set(-Math.cos(th) * 45, Math.sin(th) * 32, -55);
+      this.sun.object3D.visible = f < 0.75 && s > 0.02 && this.rainK < 0.6;
+
+      this.clouds.forEach((c) => {
+        c.object3D.position.x += dt * 0.6;
+        if (c.object3D.position.x > 70) c.object3D.position.x = -70;
+      });
+
+      if (this.rainK > 0.02) {
+        this.rain.visible = true;
+        this.rain.material.opacity = 0.5 * this.rainK;
+        const rd = this.rainData, pos = this.rainPos;
+        for (let i = 0; i < this.rainN; i++) {
+          let y = rd[i * 3 + 1] - 14 * dt;
+          if (y < 0) y += 9;
+          rd[i * 3 + 1] = y;
+          const x = rd[i * 3], z = rd[i * 3 + 2];
+          pos[i * 6]     = x;        pos[i * 6 + 1] = y;        pos[i * 6 + 2] = z;
+          pos[i * 6 + 3] = x - 0.03; pos[i * 6 + 4] = y + 0.5;  pos[i * 6 + 5] = z;
+        }
+        this.rain.geometry.attributes.position.needsUpdate = true;
+      } else {
+        this.rain.visible = false;
+      }
+    },
+
+    // ---------- Игровой цикл ----------
+    tick(time, dtMs) {
+      if (!this.ready) return;
+      const dt = Math.min(dtMs, 100) / 1000;
+      const t = time / 1000;
+
+      // время суток и погода
+      this.dayTime += dt;
+      if (this.dayTime >= DAY_LEN) { this.dayTime -= DAY_LEN; this.day++; this.newDay(); }
+      if (this.rainLeft > 0) {
+        this.rainLeft -= dt;
+        if (this.rainLeft <= 0) { this.rainLeft = 0; this.toast('Дождь закончился'); }
+      }
+      this.updateSky(dt);
+
+      // рост растений
+      for (const p of this.plots) {
+        if (p.unlocked && p.crop) {
+          if (this.rainLeft > 0) p.water = 1;
+          if (p.growth < 1 && p.water > 0) {
+            p.growth = Math.min(1, p.growth + dt / CROPS[p.crop].time);
+            p.water = Math.max(0, p.water - dt / WATER_SECONDS);
+            this.updateCrop(p);
+            if (p.growth >= 1) {
+              p.marker.visible = true;
+              this.beep(880, 0.1, 'triangle', 0.07);
+              this.toast(`${CROPS[p.crop].name} созрела — пора собирать!`);
+            }
+          }
+          if (p.growth >= 1) {
+            p.marker.rotation.y += dt * 2;
+            p.marker.position.y = 0.95 + 0.05 * Math.sin(t * 3);
+            if (p.group) p.group.scale.setScalar(1 + 0.03 * Math.sin(t * 5));
+          }
+        }
+        this.paintPlot(p);
+      }
+
+      // наведение и подсказки
+      const hv = this.getHovered();
+      const pe = hv && hv.closest ? hv.closest('.plot') : null;
+      if (pe) {
+        this.hoverBox.object3D.visible = true;
+        this.hoverBox.object3D.position.set(pe.object3D.position.x, 0.1, pe.object3D.position.z);
+      } else {
+        this.hoverBox.object3D.visible = false;
+      }
+      let tip = null;
+      if (hv && hv.closest) {
+        const b = hv.closest('.btn');
+        if (b) tip = b.dataset.hint || null;
+        else if (pe) tip = this.describePlot(this.plots[Number(pe.dataset.i)]);
+      }
+      if (!tip) tip = 'Выбрано: ' + TOOLS.find((x) => x.id === this.tool).name;
+      if (tip !== this.last.tip) { this.last.tip = tip; this.tipL.setAttribute('label', 'text', tip); }
+
+      // табло
+      const status = `Монеты: ${Math.floor(this.coins)}   День ${this.day} · ${this.timeOfDay()}${this.rainLeft > 0 ? ' · Дождь' : ''}   Грядки ${this.unlockedCount()}/${GRID * GRID}`;
+      if (status !== this.last.status) { this.last.status = status; this.hud.setAttribute('label', 'text', status); }
+
+      // сообщение
+      if (this.toastUntil && performance.now() > this.toastUntil) {
+        this.toastUntil = 0;
+        this.toastL.setAttribute('label', 'text', '');
+      }
+
+      // автосохранение
+      this.saveTimer += dt;
+      if (this.saveTimer > 8) { this.saveTimer = 0; this.save(); }
+    }
+  });
+</script>
+
+<a-scene farm renderer="antialias: true" vr-mode-ui="enabled: true">
+
+  <!-- Игрок: камера + мышь для ПК -->
+  <a-entity id="head" camera look-controls position="0 1.6 0">
+    <a-entity id="mouseRay" cursor="rayOrigin: mouse" raycaster="objects: .plot, .btn; far: 40"></a-entity>
+  </a-entity>
+
+  <!-- Контроллеры -->
+  <a-entity id="rightHand" laser-controls="hand: right"
+            raycaster="objects: .plot, .btn; far: 40; lineColor: #ffe066; lineOpacity: 0.8" trigger-act></a-entity>
+  <a-entity id="leftHand" laser-controls="hand: left"
+            raycaster="objects: .plot, .btn; far: 40; lineColor: #ffe066; lineOpacity: 0.8" trigger-act></a-entity>
+
+  <!-- Свет (интенсивность меняется по времени суток) -->
+  <a-entity id="ambient" light="type: ambient; color: #ffffff; intensity: 0.8"></a-entity>
+  <a-entity id="sunlight" light="type: directional; color: #fff4d6; intensity: 0.9" position="-4 8 -4"></a-entity>
+
+</a-scene>
+
+</body>
+</html>
